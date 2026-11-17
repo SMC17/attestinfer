@@ -1,0 +1,2 @@
+# attestinfer
+> Verifiable inference attestations and selective-disclosure Blake3 Merkle inclusion proofs in Zig 0.15.2.
