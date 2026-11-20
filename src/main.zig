@@ -1,110 +1,127 @@
+//! attestinfer CLI: Ed25519-signed receipts for a model call, verifiable by anyone with the
+//! public key. The HMAC (shared-key) mode is library and C API only: a CLI with a shared key
+//! would need that key on every verifier, and every verifier could then forge.
 const std = @import("std");
-pub const zk_infer_receipt = @import("zk_infer_receipt.zig");
+pub const receipt = @import("receipt.zig");
+/// Deprecated name kept for existing imports. Nothing in this module is zero-knowledge.
+pub const zk_infer_receipt = receipt;
 pub const c_api = @import("c_api.zig");
+const Ed25519 = std.crypto.sign.Ed25519;
 
-const DEFAULT_ENCLAVE_KEY = [_]u8{0xAB} ** 32;
+const usage =
+    \\attestinfer — signed receipts for a model call, with selective disclosure of prompt chunks
+    \\
+    \\Usage:
+    \\  attestinfer keygen <secret_key_file>          write a new Ed25519 seed (hex, mode 0600); print the public key
+    \\  attestinfer pubkey <secret_key_file>          print the public key for a seed file
+    \\  attestinfer sign <secret_key_file> <model_hex> <policy_hex> <prompt_root_hex> <output_text>
+    \\  attestinfer verify <public_key_hex> <model_hex> <policy_hex> <prompt_root_hex> <output_text> <timestamp_ns> <signature_hex>
+    \\  attestinfer bench
+    \\
+;
 
-fn parseHex32(hex: []const u8) !zk_infer_receipt.Hash256 {
-    if (hex.len != 64) return error.InvalidHexLength;
-    var out: zk_infer_receipt.Hash256 = undefined;
+fn parseHex(comptime n: usize, hex: []const u8) ![n]u8 {
+    if (hex.len != 2 * n) return error.InvalidHexLength;
+    var out: [n]u8 = undefined;
     _ = try std.fmt.hexToBytes(&out, hex);
     return out;
 }
 
-fn formatHex32(bytes: [32]u8) [64]u8 {
-    return std.fmt.bytesToHex(bytes, .lower);
+fn loadKeyPair(io: std.Io, alloc: std.mem.Allocator, path: []const u8) !Ed25519.KeyPair {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4096));
+    const seed = try parseHex(32, std.mem.trim(u8, raw, " \t\r\n"));
+    return Ed25519.KeyPair.generateDeterministic(seed);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const alloc = init.arena.allocator();
     const io = init.io;
     const stdout = std.Io.File.stdout();
-
     const args = try init.minimal.args.toSlice(alloc);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "bench")) {
-        const salt = [_]u8{0x11} ** 16;
-        const leaves = [_]zk_infer_receipt.Hash256{
-            zk_infer_receipt.hashChunk("system: obey policy", salt),
-            zk_infer_receipt.hashChunk("private_user_prompt", salt),
-        };
-        const root = try zk_infer_receipt.buildMerkleRoot(alloc, &leaves);
-        const key = DEFAULT_ENCLAVE_KEY;
-        const model_h = [_]u8{0x01} ** 32;
-        const policy_h = [_]u8{0x02} ** 32;
+    var buf: [1024]u8 = undefined;
 
-        const t0 = std.Io.Clock.awake.now(io);
-        var i: usize = 0;
-        var ok_count: usize = 0;
-        while (i < 5000) : (i += 1) {
-            const att = zk_infer_receipt.signAttestation(model_h, policy_h, root, "verified output", @intCast(i), key);
-            if (zk_infer_receipt.verifyAttestation(att, key)) ok_count += 1;
-        }
-        std.mem.doNotOptimizeAway(ok_count);
-        const t1 = std.Io.Clock.awake.now(io);
-        const attest_ns: i96 = @divTrunc(t0.durationTo(t1).nanoseconds, 5000);
-
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"attest_verify_ns\":{d}}}\n", .{attest_ns});
-        try stdout.writeStreamingAll(io, msg);
-        return;
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "keygen")) {
+        const kp = Ed25519.KeyPair.generate(io);
+        const seed_hex = std.fmt.bytesToHex(kp.secret_key.seed(), .lower);
+        const f = try std.Io.Dir.cwd().createFile(io, args[2], .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer f.close(io);
+        try f.writeStreamingAll(io, &seed_hex);
+        try f.writeStreamingAll(io, "\n");
+        try stdout.writeStreamingAll(io, try std.fmt.bufPrint(&buf, "{{\"public_key\":\"{s}\"}}\n", .{std.fmt.bytesToHex(kp.public_key.toBytes(), .lower)}));
+        return 0;
     }
-
-    if (args.len >= 5 and std.mem.eql(u8, args[1], "sign")) {
-        const model_h = try parseHex32(args[2]);
-        const policy_h = try parseHex32(args[3]);
-        const output_text = args[4];
-        const prompt_root = [_]u8{0x00} ** 32;
-        const ts_ns: i128 = std.Io.Clock.real.now(io).nanoseconds;
-        const att = zk_infer_receipt.signAttestation(model_h, policy_h, prompt_root, output_text, ts_ns, DEFAULT_ENCLAVE_KEY);
-
-        var buf: [512]u8 = undefined;
-        const msg = try std.fmt.bufPrint(
-            &buf,
-            "{{\"model_hash\":\"{s}\",\"policy_hash\":\"{s}\",\"prompt_merkle_root\":\"{s}\",\"output_hash\":\"{s}\",\"timestamp_ns\":{d},\"attestation_mac\":\"{s}\"}}\n",
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "pubkey")) {
+        const kp = try loadKeyPair(io, alloc, args[2]);
+        try stdout.writeStreamingAll(io, try std.fmt.bufPrint(&buf, "{s}\n", .{std.fmt.bytesToHex(kp.public_key.toBytes(), .lower)}));
+        return 0;
+    }
+    if (args.len >= 7 and std.mem.eql(u8, args[1], "sign")) {
+        const kp = try loadKeyPair(io, alloc, args[2]);
+        const ts: i128 = std.Io.Clock.real.now(io).nanoseconds;
+        const r = try receipt.signEd25519(kp, try parseHex(32, args[3]), try parseHex(32, args[4]), try parseHex(32, args[5]), args[6], ts);
+        try stdout.writeStreamingAll(io, try std.fmt.bufPrint(&buf,
+            "{{\"model_hash\":\"{s}\",\"policy_hash\":\"{s}\",\"prompt_merkle_root\":\"{s}\",\"output_hash\":\"{s}\",\"timestamp_ns\":{d},\"public_key\":\"{s}\",\"signature\":\"{s}\"}}\n",
             .{
-                formatHex32(att.model_hash),
-                formatHex32(att.policy_hash),
-                formatHex32(att.prompt_merkle_root),
-                formatHex32(att.output_hash),
-                att.timestamp_ns,
-                formatHex32(att.attestation_mac),
-            },
-        );
-        try stdout.writeStreamingAll(io, msg);
-        return;
+                std.fmt.bytesToHex(r.model_hash, .lower),
+                std.fmt.bytesToHex(r.policy_hash, .lower),
+                std.fmt.bytesToHex(r.prompt_merkle_root, .lower),
+                std.fmt.bytesToHex(r.output_hash, .lower),
+                r.timestamp_ns,
+                std.fmt.bytesToHex(r.public_key, .lower),
+                std.fmt.bytesToHex(r.signature, .lower),
+            }));
+        return 0;
     }
-
-    if (args.len >= 8 and std.mem.eql(u8, args[1], "verify")) {
-        const model_h = try parseHex32(args[2]);
-        const policy_h = try parseHex32(args[3]);
-        const prompt_root = try parseHex32(args[4]);
-        const output_text = args[5];
-        const ts_ns = try std.fmt.parseInt(i128, args[6], 10);
-        const mac = try parseHex32(args[7]);
-
-        var out_hash: zk_infer_receipt.Hash256 = undefined;
-        std.crypto.hash.Blake3.hash(output_text, &out_hash, .{});
-
-        const att = zk_infer_receipt.InferenceAttestation{
-            .model_hash = model_h,
-            .policy_hash = policy_h,
-            .prompt_merkle_root = prompt_root,
-            .output_hash = out_hash,
-            .timestamp_ns = ts_ns,
-            .attestation_mac = mac,
+    if (args.len >= 9 and std.mem.eql(u8, args[1], "verify")) {
+        const pk = try parseHex(32, args[2]);
+        const r = receipt.SignedReceipt{
+            .model_hash = try parseHex(32, args[3]),
+            .policy_hash = try parseHex(32, args[4]),
+            .prompt_merkle_root = try parseHex(32, args[5]),
+            .output_hash = receipt.hashOutput(args[6]),
+            .timestamp_ns = try std.fmt.parseInt(i128, args[7], 10),
+            .public_key = pk,
+            .signature = try parseHex(64, args[8]),
         };
-        const valid = zk_infer_receipt.verifyAttestation(att, DEFAULT_ENCLAVE_KEY);
-        var buf: [64]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"valid\":{}}}\n", .{valid});
-        try stdout.writeStreamingAll(io, msg);
-        if (!valid) std.process.exit(1);
-        return;
+        const valid = receipt.verifyEd25519(r, pk);
+        try stdout.writeStreamingAll(io, try std.fmt.bufPrint(&buf, "{{\"valid\":{}}}\n", .{valid}));
+        return if (valid) 0 else 1;
     }
-
-    try stdout.writeStreamingAll(
-        io,
-        "attestinfer — Verifiable Inference Attestation & Selective-Disclosure Merkle Proofs\n\nUsage:\n  attestinfer bench\n  attestinfer sign <model_hex> <policy_hex> <output_text>\n  attestinfer verify <model_hex> <policy_hex> <prompt_root_hex> <output_text> <timestamp_ns> <mac_hex>\n",
-    );
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "bench")) {
+        // Fixed keys: this measures speed only.
+        const salt = [_]u8{0x11} ** 16;
+        const leaves = [_]receipt.Hash256{ receipt.hashChunk("system: obey policy", salt), receipt.hashChunk("private_user_prompt", salt) };
+        const root = try receipt.buildMerkleRoot(alloc, &leaves);
+        const mh = [_]u8{1} ** 32;
+        const ph = [_]u8{2} ** 32;
+        const hkey = [_]u8{0xAB} ** 32;
+        var ok: usize = 0;
+        var t = std.Io.Clock.awake.now(io);
+        var i: usize = 0;
+        while (i < 5000) : (i += 1) {
+            const att = receipt.signAttestation(mh, ph, root, "verified output", @intCast(i), hkey);
+            if (receipt.verifyAttestation(att, hkey)) ok += 1;
+        }
+        const hmac_ns = @divTrunc(t.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, 5000);
+        const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{7} ** 32);
+        const pk = kp.public_key.toBytes();
+        t = std.Io.Clock.awake.now(io);
+        i = 0;
+        while (i < 2000) : (i += 1) _ = try receipt.signEd25519(kp, mh, ph, root, "verified output", @intCast(i));
+        const sign_ns = @divTrunc(t.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, 2000);
+        const r = try receipt.signEd25519(kp, mh, ph, root, "verified output", 1);
+        t = std.Io.Clock.awake.now(io);
+        i = 0;
+        while (i < 2000) : (i += 1) {
+            if (receipt.verifyEd25519(r, pk)) ok += 1;
+        }
+        const verify_ns = @divTrunc(t.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, 2000);
+        std.mem.doNotOptimizeAway(ok);
+        try stdout.writeStreamingAll(io, try std.fmt.bufPrint(&buf, "{{\"hmac_tag_and_verify_ns\":{d},\"ed25519_sign_ns\":{d},\"ed25519_verify_ns\":{d}}}\n", .{ hmac_ns, sign_ns, verify_ns }));
+        return 0;
+    }
+    try stdout.writeStreamingAll(io, usage);
+    return 2;
 }
 
 test {

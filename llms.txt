@@ -1,8 +1,8 @@
 # attestinfer
-> HMAC-tagged receipts binding model, policy, prompt-Merkle-root and output hashes, with salted Merkle selective disclosure of prompt chunks, in Zig 0.16. Shared-key integrity only: not publicly verifiable, not zero-knowledge.
+> Ed25519-signed (or HMAC-tagged) receipts binding model, policy, prompt-Merkle-root, output hash and timestamp, with salted, domain-separated Merkle selective disclosure of prompt chunks, in Zig 0.16. Not zero-knowledge; does not prove a model ran.
 
-- `signAttestation` / `verifyAttestation`: HMAC-SHA256 over (model_hash, policy_hash, prompt_merkle_root, output_hash, timestamp). Anyone who can verify can forge (#2).
-- `hashChunk`, `buildMerkleRoot`, `verifyInclusion`: salted Blake3 Merkle commitments; disclosing a chunk reveals it.
-- C API `libattestinfer`, Python `python/attestinfer.py`.
+- CLI: `keygen <seed_file>`, `pubkey`, `sign <seed_file> <model> <policy> <root> <output>`, `verify <pubkey> ... <ts> <sig>` (Ed25519; no built-in key).
+- Library: `signEd25519`/`verifyEd25519` (public), `signAttestation`/`verifyAttestation` (shared-key HMAC), `hashChunk`, `buildMerkleRoot`, `merkleProof`, `verifyInclusion`.
+- C API `libattestinfer` (HMAC + `attestinfer_ed25519_sign/verify`), Python `python/attestinfer.py`.
 
 README.md is the source of truth, including measured numbers with hardware and commit.
